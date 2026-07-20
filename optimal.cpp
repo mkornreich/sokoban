@@ -1,4 +1,4 @@
-// Move-OPTIMAL Sokoban solver (CS161 variant: keeper must also end on a goal).
+// Move-OPTIMAL Sokoban solver (Sokoban Variant: keeper must also end on a goal).
 //
 // Techniques:
 //  * Compact encoding: boxes = a bitmask over the <=32 "live" cells (uint32),
