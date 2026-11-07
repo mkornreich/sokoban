@@ -21,6 +21,9 @@
 // pruning. Successors with f >= best-known solution are never queued, and a
 // level stops as soon as best <= f (all cheaper levels are already exhausted,
 // so best is provably optimal).
+// * Keeper-dominance pruning (fast path): a popped state is skipped when an
+// already-expanded state with the same boxes can walk to its keeper cell for
+// no more than its g (see DomHash). p15: 49.1M -> 21.4M expansions.
 // * Workers keep per-thread counters and per-(thread,f) successor chunks that
 // are bulk-merged after each wave. No shared-cacheline atomics in the loop.
 // * Unsigned throughout: cells, distances, and live-bit indices are uint32 with
@@ -30,7 +33,7 @@
 // Reports the optimal move count.  With --solution (-s) it also reconstructs and
 // prints an optimal move path (lowercase u/d/l/r = keeper walk, uppercase = push),
 // recovered from the completed g-map after the search.
-// Usage: ./solver <boardId> [timeoutSec] [--solution|-s] [dbg]
+// Usage: ./solver <boardId> [timeoutSec] [--solution|-s] [--no-dominance] [dbg]
 // Build: g++ -O3 -march=native -std=c++17 -pthread solver.cpp -o solver
 
 #include <cstdio>
@@ -97,10 +100,12 @@ inline bool inb(int r, int c) { return r >= 0 && r < (int)R && c >= 0 && c < (in
 
 // 2MB-aligned allocation marked for transparent huge pages: the hash tables are
 // gigabytes hit at random, so 4K pages would thrash the TLB.
-static void* bigalloc(size_t bytes) {
+// required=false returns nullptr on failure instead of exiting (for optional tables).
+static void* bigalloc(size_t bytes, bool required = true) {
   const size_t ALIGN = 2ull << 20;
   bytes = (bytes + ALIGN - 1) & ~(ALIGN - 1);
   void* p = aligned_alloc(ALIGN, bytes);
+  if (!p && !required) return nullptr;
   if (!p) { fprintf(stderr, "out of memory (%zu bytes)\n", bytes); exit(2); }
 #if defined(__linux__)
   madvise(p, bytes, MADV_HUGEPAGE);
@@ -185,7 +190,7 @@ template<class M> inline bool isFrozen(uint32_t cell, M mask) { return frozenRec
 // can run on many cores at once ----
 struct Scratch {
   vector<uint32_t> kdist, kstamp, queue; uint32_t kcur;
-  uint64_t ex, gen;               // per-thread counters (no shared-cacheline atomics)
+  uint64_t ex, gen, pr;           // per-thread counters (no shared-cacheline atomics); pr = dominance-pruned
 };
 template<class M> void keeperBFS(Scratch& sc, M mask, uint32_t keeper) {
   if (sc.kcur == UINT32_MAX) { fill(sc.kstamp.begin(), sc.kstamp.end(), 0u); sc.kcur = 0; }  // stamp wrap guard
@@ -200,6 +205,30 @@ template<class M> void keeperBFS(Scratch& sc, M mask, uint32_t keeper) {
   }
 }
 inline bool kReach(Scratch& sc, uint32_t cell) { return cell != NONE && sc.kstamp[cell] == sc.kcur; }
+// keeperBFS that doubles as the dominance test (see DomHash): tk[i] / budget[i]
+// are stored variants' keeper cells and walk budgets (g - ga). Returns true as
+// soon as some tk[i] is reached within budget[i] moves, leaving the BFS
+// incomplete (the state is skipped anyway). Otherwise it runs to completion
+// exactly like keeperBFS.
+template<class M> bool keeperBFSDom(Scratch& sc, M mask, uint32_t keeper, const uint32_t* tk, const uint32_t* budget, unsigned nt) {
+  if (sc.kcur == UINT32_MAX) { fill(sc.kstamp.begin(), sc.kstamp.end(), 0u); sc.kcur = 0; }  // stamp wrap guard
+  sc.kcur++; sc.kstamp[keeper] = sc.kcur; sc.kdist[keeper] = 0;
+  uint32_t maxBudget = 0;
+  for (unsigned i = 0; i < nt; i++) { if (tk[i] == keeper) return true; if (budget[i] > maxBudget) maxBudget = budget[i]; }
+  unsigned h = 0, tail = 0; sc.queue[tail++] = keeper;
+  while (h < tail) {
+    uint32_t cur = sc.queue[h++]; uint32_t base = cur * 4, d = sc.kdist[cur] + 1;
+    const bool check = d <= maxBudget;
+    for (unsigned dir = 0; dir < 4; dir++) {
+      uint32_t n = NB[base + dir]; if (n == NONE || WALL[n] || boxAt(mask, n)) continue;
+      if (sc.kstamp[n] != sc.kcur) {
+        sc.kstamp[n] = sc.kcur; sc.kdist[n] = d; sc.queue[tail++] = n;
+        if (check) for (unsigned i = 0; i < nt; i++) if (n == tk[i] && d <= budget[i]) return true;
+      }
+    }
+  }
+  return false;
+}
 
 // ---- persistent worker pool: threads are spawned once and woken per wave via a
 // generation counter (hundreds of waves would otherwise pay thread create+join
@@ -303,6 +332,74 @@ struct AHash {
   inline uint32_t val(size_t i) { return (uint32_t)(a[i].load(memory_order_relaxed) & VALMASK); }
   size_t slots() { return capMask + 1; }
   bool occupied(size_t i, uint32_t& mask, uint32_t& keeper, uint32_t& v) { uint64_t cur = a[i].load(memory_order_relaxed); if (cur == EMPTY) return false; uint64_t key = cur >> 24; mask = (uint32_t)(key >> 8); keeper = (uint32_t)(key & 0xff); v = (uint32_t)(cur & VALMASK); return true; }
+};
+
+// ---- KEEPER-DOMINANCE table (fast path only) ----
+// Many states share a box layout and differ only in where the keeper stands
+// (p15: 49M states over just 6M layouts, ~8 keeper cells each). State
+// b = (B, kb, gb) is DOMINATED by an already-expanded a = (B, ka, ga) when the
+// keeper can walk ka -> kb and ga + walk(ka, kb) <= gb: every push b can make,
+// a can make at least as cheaply by walking to kb first (triangle inequality),
+// and likewise the finishing walk onto a free goal. So expanding b cannot lower
+// any g (on p15 the generated-state count is identical with and without this
+// pruning) and b is skipped. It stays closed in the hash, so --solution
+// reconstruction is unaffected: a g-tight predecessor always has an exact g.
+// Same box layout => same h, so a dominator has a strictly smaller f and was
+// expanded at an earlier level; within one level two distinct variants can never
+// dominate each other (that would need a zero-length walk), so concurrent
+// workers cannot mis-prune. Dominance by a pruned state is also fine:
+// dominance is transitive through walks.
+//
+// The table remembers the first DOMK variants expanded per box layout, i.e. the
+// lowest-g ones, since a layout's variants come out in increasing g. On p15
+// that prunes 56% of popped states (checking every variant would reach 57.5%).
+// It is keyed by the mask alone, so its slot is prefetched together with the
+// main hash slot, and keeperBFSDom performs the test, stopping as soon as it
+// reaches a stored variant's cell within budget. It is purely an accelerator:
+// a full table or a long probe just skips the check, and if it cannot be
+// allocated the search runs without it.
+// Slot = mask << 32 | keeper << 16 | g (MAXF < 2^16). ~0 is EMPTY.
+constexpr unsigned DOMK = 4;
+struct DomHash {
+  atomic<uint64_t>* a = nullptr; uint64_t capMask = 0;
+  static constexpr uint64_t EMPTY = ~0ull;
+  static constexpr unsigned MAXPROBE = 24;
+  bool init(size_t cap) {
+    size_t s = 1; while (s < cap) s <<= 1;
+    a = (atomic<uint64_t>*)bigalloc(s * sizeof(uint64_t), false);
+    if (!a) return false;
+    capMask = s - 1;
+    memset((void*)a, 0xFF, s * sizeof(uint64_t));
+    return true;
+  }
+  ~DomHash() { free((void*)a); }
+  static inline uint64_t mix(uint64_t x) { x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; x ^= x >> 33; return x; }
+  inline size_t home(uint32_t mask) const { return mix((uint64_t)mask ^ 0x5bd1e9955bd1e995ull) & capMask; }
+  inline void prefetch(uint32_t mask) { __builtin_prefetch(&a[home(mask)]); }
+  // Collect stored variants of `mask` that could dominate a state with this g
+  // (ga <= g): keeper cells and walk budgets g - ga. Also report how many
+  // variants are stored and the empty slot ending the probe chain (for record).
+  unsigned lookup(uint32_t mask, uint32_t g, uint32_t* tk, uint32_t* budget, unsigned& stored, size_t& emptySlot) {
+    size_t i = home(mask); unsigned n = 0; stored = 0; emptySlot = NPOS;
+    for (unsigned probes = 0; probes < MAXPROBE; probes++) {
+      uint64_t cur = a[i].load(memory_order_relaxed);
+      if (cur == EMPTY) { emptySlot = i; break; }
+      if ((uint32_t)(cur >> 32) == mask) {
+        stored++;
+        uint32_t ga = (uint32_t)cur & 0xffff;
+        if (ga <= g && n < DOMK) { tk[n] = (uint32_t)(cur >> 16) & 0xff; budget[n] = g - ga; n++; }
+      }
+      i = (i + 1) & capMask;
+    }
+    return n;
+  }
+  // Record an expanded (non-dominated) variant if the layout has room. A lost
+  // CAS just means another worker took the slot; recording is best-effort.
+  void record(uint32_t mask, uint32_t keeper, uint32_t g, unsigned stored, size_t emptySlot) {
+    if (stored >= DOMK || emptySlot == NPOS) return;
+    uint64_t exp = EMPTY, des = ((uint64_t)mask << 32) | ((uint64_t)keeper << 16) | g;
+    a[emptySlot].compare_exchange_strong(exp, des, memory_order_relaxed);
+  }
 };
 
 // ---- WIDE PATH hash (33..128 live cells): the mask no longer fits beside the
@@ -413,7 +510,7 @@ template<class M> static string keeperPathMoves(M mask, uint32_t src, uint32_t d
 // ---- the search + optional reconstruction, templated on the box-mask type M and
 // its matching hash H (AHash for uint32, WideHash<M> for the wide case) ----
 template<class M, class H>
-int run(const string& board, double timeout, bool wantSolution, bool dbg) {
+int run(const string& board, double timeout, bool wantSolution, bool dbg, bool useDom) {
   // a start box on a dead square (liveIdx == NONE) can never reach any goal.
   // catch it BEFORE building the mask. A NONE shift would be UB and the box
   // would vanish.
@@ -452,6 +549,11 @@ int run(const string& board, double timeout, bool wantSolution, bool dbg) {
     hashSize = 1 << 16; while (hashSize < want) hashSize <<= 1;
   }
   H hash; hash.init(hashSize);
+  // keeper-dominance table: a quarter of the main table's slots (p15: 2^25 =
+  // 256 MiB; it holds at most DOMK variants per layout, ~6M layouts on p15).
+  // Optional: if it can't be allocated the search runs without it.
+  DomHash dom;
+  if constexpr (sizeof(M) <= 4) { if (useDom && !dom.init(hashSize / 4)) useDom = false; } else useDom = false;
 
   constexpr uint32_t MAXF = 6000;
   using E = Ent<M>;
@@ -465,7 +567,7 @@ int run(const string& board, double timeout, bool wantSolution, bool dbg) {
   atomic<uint32_t> best(NONE);                      // NONE = no solution known yet
   Pool pool; bool poolInited = false;               // spawned on first parallel wave
   vector<Scratch> scratch(NT);
-  for (auto& sc : scratch) { sc.kdist.assign(N, 0); sc.kstamp.assign(N, 0); sc.queue.assign(N, 0); sc.kcur = 0; sc.ex = sc.gen = 0; }
+  for (auto& sc : scratch) { sc.kdist.assign(N, 0); sc.kstamp.assign(N, 0); sc.queue.assign(N, 0); sc.kcur = 0; sc.ex = sc.gen = sc.pr = 0; }
   // per-(thread,f) successor chunks + touched-f lists: workers append locally,
   // the merge step moves whole chunks. No per-element copying, no locks.
   vector<vector<vector<E>>> tf(NT, vector<vector<E>>(MAXF));
@@ -477,19 +579,32 @@ int run(const string& board, double timeout, bool wantSolution, bool dbg) {
   auto t0 = chrono::steady_clock::now();
   auto sumEx = [&]() { uint64_t s = 0; for (auto& sc : scratch) s += sc.ex; return s; };
   auto sumGen = [&]() { uint64_t s = 0; for (auto& sc : scratch) s += sc.gen; return s; };
+  auto sumPr = [&]() { uint64_t s = 0; for (auto& sc : scratch) s += sc.pr; return s; };
 
   // expand one wave of same-f entries. Returns the successors that land back in f.
   auto processWave = [&](vector<E>& wave, uint32_t f) -> vector<E> {
     auto worker = [&](unsigned wi, size_t stride) {
       Scratch& sc = scratch[wi];
       auto& myTf = tf[wi]; auto& myTouched = touched[wi]; auto& cands = candBuf[wi];
-      uint64_t ex = 0, gen = 0;
+      uint64_t ex = 0, gen = 0, pr = 0;
       for (size_t j = wi; j < wave.size(); j += stride) {
-        if (j + stride < wave.size()) { const E& e2 = wave[j + stride]; hash.prefetch(e2.msk(), e2.kpr()); }
+        if (j + stride < wave.size()) {
+          const E& e2 = wave[j + stride]; hash.prefetch(e2.msk(), e2.kpr());
+          if constexpr (sizeof(M) <= 4) { if (useDom) dom.prefetch(e2.msk()); }
+        }
         M mask = wave[j].msk(); uint32_t keeper = wave[j].kpr(), g = wave[j].gv();
         if (!hash.claim(mask, keeper, g)) continue;            // stale, closed, or another thread won it
+        // keeper BFS; on the fast path it also tests keeper dominance and skips
+        // the state (it stays closed) if an expanded variant can walk here
+        if constexpr (sizeof(M) <= 4) {
+          if (useDom) {
+            uint32_t tk[DOMK], budget[DOMK]; unsigned stored; size_t emptySlot;
+            unsigned nt = dom.lookup(mask, g, tk, budget, stored, emptySlot);
+            if (keeperBFSDom(sc, mask, keeper, tk, budget, nt)) { pr++; continue; }
+            dom.record(mask, keeper, g, stored, emptySlot);
+          } else keeperBFS(sc, mask, keeper);
+        } else keeperBFS(sc, mask, keeper);
         ex++;
-        keeperBFS(sc, mask, keeper);
         // all boxes placed? -> finish by walking keeper to nearest free goal
         // (NONE = max, so the min-update needs no separate presence check)
         if ((mask & goalBoxMask) == mask) {
@@ -536,7 +651,7 @@ int run(const string& board, double timeout, bool wantSolution, bool dbg) {
           }
         }
       }
-      sc.ex += ex; sc.gen += gen;
+      sc.ex += ex; sc.gen += gen; sc.pr += pr;
     };
     if (NT == 1 || wave.size() < 2000) { worker(0, 1); }           // small wave: skip pool overhead
     else {
@@ -577,7 +692,7 @@ int run(const string& board, double timeout, bool wantSolution, bool dbg) {
         lastReport = ex;
         double el = chrono::duration<double>(chrono::steady_clock::now() - t0).count();
         uint32_t bb = best.load(memory_order_relaxed);
-        printf("  ...expanded %llu, f=%u gen=%llu best=%d %.0fs\n", (unsigned long long)ex, f, (unsigned long long)sumGen(), bb == NONE ? -1 : (int)bb, el);
+        printf("  ...expanded %llu, f=%u gen=%llu pruned=%llu best=%d %.0fs\n", (unsigned long long)ex, f, (unsigned long long)sumGen(), (unsigned long long)sumPr(), bb == NONE ? -1 : (int)bb, el);
         fflush(stdout);
         if (el > timeout) { timedOut = true; lbAtTimeout = f; break; }
       }
@@ -586,10 +701,10 @@ int run(const string& board, double timeout, bool wantSolution, bool dbg) {
 
   double el = chrono::duration<double>(chrono::steady_clock::now() - t0).count();
   uint32_t bestv = best.load(memory_order_relaxed);
-  uint64_t ex = sumEx(), gen = sumGen();
-  if (timedOut) { printf("RESULT %s optimal=TIMEOUT lower_bound=%u best_found=%s expanded=%llu seconds=%.1f threads=%u\n", board.c_str(), lbAtTimeout, bestv == NONE ? "none" : to_string(bestv).c_str(), (unsigned long long)ex, el, NT); return 0; }
-  if (bestv != NONE) printf("RESULT %s optimal=%u expanded=%llu generated=%llu seconds=%.1f threads=%u\n", board.c_str(), bestv, (unsigned long long)ex, (unsigned long long)gen, el, NT);
-  else printf("RESULT %s optimal=NONE expanded=%llu seconds=%.1f threads=%u\n", board.c_str(), (unsigned long long)ex, el, NT);
+  uint64_t ex = sumEx(), gen = sumGen(), prn = sumPr();
+  if (timedOut) { printf("RESULT %s optimal=TIMEOUT lower_bound=%u best_found=%s expanded=%llu pruned=%llu seconds=%.1f threads=%u\n", board.c_str(), lbAtTimeout, bestv == NONE ? "none" : to_string(bestv).c_str(), (unsigned long long)ex, (unsigned long long)prn, el, NT); return 0; }
+  if (bestv != NONE) printf("RESULT %s optimal=%u expanded=%llu pruned=%llu generated=%llu seconds=%.1f threads=%u\n", board.c_str(), bestv, (unsigned long long)ex, (unsigned long long)prn, (unsigned long long)gen, el, NT);
+  else printf("RESULT %s optimal=NONE expanded=%llu pruned=%llu seconds=%.1f threads=%u\n", board.c_str(), (unsigned long long)ex, (unsigned long long)prn, el, NT);
 
   // ---- optional: reconstruct one optimal move path from the completed g-map ----
   // The hash still holds the optimal g of every explored (boxMask, keeper) state
@@ -652,13 +767,14 @@ int run(const string& board, double timeout, bool wantSolution, bool dbg) {
 
 int main(int argc, char** argv) {          // argc/argv/return are int by the language
   // Parse args: positionals are <boardId> [timeoutSec]. Flags may appear anywhere.
-  string board = "p15"; double timeout = 600.0; bool wantSolution = false, dbg = false;
+  string board = "p15"; double timeout = 600.0; bool wantSolution = false, dbg = false, useDom = true;
   {
     vector<string> pos;
     for (int i = 1; i < argc; i++) {
       string a = argv[i];
       if (a == "--solution" || a == "-s" || a == "sol") wantSolution = true;
       else if (a == "dbg") dbg = true;
+      else if (a == "--no-dominance" || a == "nodom") useDom = false;
       else pos.push_back(a);
     }
     if (pos.size() >= 1) board = pos[0];
@@ -670,8 +786,8 @@ int main(int argc, char** argv) {          // argc/argv/return are int by the la
   // Dispatch on live-cell count: <=32 uses the fast uint32 mask + packed hash.
   // 33..128 uses a 128-bit mask + wide hash. Beyond that is unsupported.
   if (N > 255) { printf("RESULT %s optimal=UNSUPPORTED (%u cells exceeds 8-bit keeper index)\n", board.c_str(), N); return 0; }
-  if (L <= 32) return run<uint32_t, AHash>(board, timeout, wantSolution, dbg);
-  if (L <= 128) return run<unsigned __int128, WideHash<unsigned __int128>>(board, timeout, wantSolution, dbg);
+  if (L <= 32) return run<uint32_t, AHash>(board, timeout, wantSolution, dbg, useDom);
+  if (L <= 128) return run<unsigned __int128, WideHash<unsigned __int128>>(board, timeout, wantSolution, dbg, useDom);
   printf("RESULT %s optimal=UNSUPPORTED (live=%u exceeds the 128-bit box mask)\n", board.c_str(), L);
   return 0;
 }

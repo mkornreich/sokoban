@@ -19,7 +19,7 @@ when available (Linux) but is not required.
 ## Running
 
 ```bash
-./solver <boardId> [timeoutSec] [--solution|-s] [dbg]
+./solver <boardId> [timeoutSec] [--solution|-s] [--no-dominance] [dbg]
 ```
 
 | Argument     | Meaning                                                        | Default |
@@ -27,6 +27,7 @@ when available (Linux) but is not required.
 | `boardId`    | one of the built-in boards `p1` … `p15`                        | `p15`   |
 | `timeoutSec` | wall-clock limit for the search                                 | `600`   |
 | `--solution` | also reconstruct and print one optimal move sequence (`-s`, `sol`) | off |
+| `--no-dominance` | disable keeper-dominance pruning (`nodom`), for comparison | on |
 | `dbg`        | print per-box heuristic details and exit (debugging aid)       | off     |
 
 Positional arguments are `boardId` then `timeoutSec`. Flags may appear anywhere.
@@ -34,8 +35,9 @@ Positional arguments are `boardId` then `timeoutSec`. Flags may appear anywhere.
 ```
 $ ./solver p15 600 --solution
 [p15] boxes=8 goals=9 live=32 h0=32 timeout=600s
-  ...expanded 4221749, f=82 gen=10083381 best=-1 0s      <- progress every ~4M expansions
-RESULT p15 optimal=184 expanded=49090929 generated=76482528 seconds=5.3 threads=24
+  ...expanded 4120572, f=87 gen=17268883 pruned=3658135 best=-1 1s      <- progress every ~4M expansions
+  ...
+RESULT p15 optimal=184 expanded=21399369 pruned=27691560 generated=76488946 seconds=2.9 threads=24
 SOLUTION p15 moves=184 RdRdRdRRUrDDDrdLL...
 ```
 
@@ -65,7 +67,7 @@ allowed (they may stay empty). One goal must be left free for the keeper.
 
 Verified optima: p1=6, p2=15, p3=13, p4=17, p5=12, p6=13, p7=47, p8=22, p9=34,
 p10=59, p11=51, p12=41, p13=78, p14=26, p15=184. All solve in well under a
-second except p15 (~5 s / ~1.2 GB on a 12-core desktop).
+second except p15 (~3 s / ~1.5 GB on a 12-core desktop).
 
 ## Algorithm
 
@@ -89,7 +91,9 @@ Memory: the best-g hash is allocated eagerly and sized by live-cell count.
 32 MiB for boards with < 24 live cells, 1 GiB for 24–32 live cells (p7,
 p15), and an estimate-based size (up to ~800 MiB) on the wide path. Machines
 with less free RAM than that get a clean `out of memory` abort before the
-search starts.
+search starts. The fast path also allocates the keeper-dominance table at a
+quarter of the hash's slots (256 MiB for p15). It is optional: if that
+allocation fails, the search runs without dominance pruning.
 
 ### Search: move-optimal A* over macro pushes
 
@@ -124,6 +128,43 @@ discarded unless the box lands on a goal.
 never be expanded), though their `g` is still recorded for reconstruction.
 * Boards where a starting box sits on a dead square are reported `UNSOLVABLE`
 immediately.
+
+#### Keeper-dominance pruning
+
+Many states share a box layout and differ only in where the keeper stands.
+p15's 49 M states cover just 6 M box layouts, about 8 keeper cells each.
+A popped state `(B, kb, gb)` is *dominated* by an already-expanded state
+`(B, ka, ga)` with the same boxes when the keeper can walk from `ka` to `kb`
+and `ga + walk(ka, kb) ≤ gb`. Every push the dominated state could make, the
+dominating one can make at least as cheaply by walking to `kb` first (triangle
+inequality on walks), and the same holds for the finishing walk onto a free
+goal. So expanding it can never lower any `g`, and it is skipped. It stays
+closed in the hash, so solution reconstruction is unaffected: a g-tight
+predecessor always has an exact `g`.
+
+Optimality holds under parallelism too. States with the same boxes have the
+same `h`, so a dominator always has a strictly smaller `f` and was expanded at
+an earlier level. Within one level, two distinct variants can never dominate
+each other, since that would need a zero-length walk.
+
+The implementation (`DomHash`, fast path only) is a lock-free side table keyed
+by the box mask. It remembers the first 4 variants expanded per layout, i.e.
+the lowest-`g` ones, because a layout's variants come out in increasing `g`.
+Its slot is prefetched alongside the main hash slot. The keeper BFS that every
+expansion runs anyway does the test (`keeperBFSDom`). It stops as soon as it
+reaches a stored variant's cell within that variant's walk budget `g − ga`, so
+pruned states also skip most of their BFS. The table is purely an
+accelerator: when it is full or a probe runs long, the check is skipped.
+
+| p15, 12-core / 24-thread desktop | expanded | pruned | 1 thread | 12 threads | 24 threads | peak RSS |
+|---|---|---|---|---|---|---|
+| `--no-dominance` | 49,090,929 | 0 | 26.9 s | 5.8 s | 4.2 s | 1.21 GB |
+| default | 21,399,255 | 27,691,674 | 17.6 s | 3.8 s | 2.9 s | 1.47 GB |
+
+The generated-state count is identical with and without the pruning (76.49 M
+single-threaded), which confirms that every skipped expansion was redundant.
+Checking against *every* expanded variant (measured offline) would prune at
+most 57.5% of states, vs. the 56% the 4-variant table achieves.
 
 ### Parallelism
 
@@ -167,6 +208,6 @@ The search is memory-latency bound, so the implementation leans on:
 4 KB pages would thrash the TLB). Software prefetch of upcoming hash slots.
 Bucket entries packed into single `uint64`s on the fast path. And the chunked
 merge above. The 1 GiB table (2²⁷ slots) used for large fast-path boards was
-measured fastest for the hardest built-in board. p15 closes ~49 M states at
-roughly 9 M expansions/s on a 12-core (24-thread) desktop. Larger tables
-measurably hurt (TLB spread), smaller ones lengthen probe chains.
+measured fastest for the hardest built-in board. p15 pops ~49 M states (21 M
+expanded, 28 M dominance-pruned) in ~2.9 s on a 12-core (24-thread) desktop.
+Larger tables measurably hurt (TLB spread), smaller ones lengthen probe chains.
