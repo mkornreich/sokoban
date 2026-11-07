@@ -24,6 +24,8 @@
 // * Keeper-dominance pruning (fast path): a popped state is skipped when an
 // already-expanded state with the same boxes can walk to its keeper cell for
 // no more than its g (see DomHash). p15: 49.1M -> 21.4M expansions.
+// * Bitboard keeper BFS (keeperBFSbb): branch-free layer-by-layer flood fill
+// over a 256-bit grid, writing distances only where the search reads them.
 // * Workers keep per-thread counters and per-(thread,f) successor chunks that
 // are bulk-merged after each wave. No shared-cacheline atomics in the loop.
 // * Unsigned throughout: cells, distances, and live-bit indices are uint32 with
@@ -156,6 +158,33 @@ void setup(const vector<string>& g) {
   L = (unsigned)liveCell.size();
 }
 
+// ---- 256-bit bitboards for the keeper flood fill (keeperBFSbb) ----
+// Cell (r, c) maps to bit r * BW + c with BW = C + 1: the extra pad column is
+// never free, so the +-1 shifts cannot wrap from one row into the next. Used
+// whenever the padded grid fits in 255 bits (all built-in boards; p15 needs
+// 143), else the queue BFS runs.
+struct BB { uint64_t w[4]; };
+static inline void bbSet(BB& a, unsigned pb) { a.w[pb >> 6] |= 1ull << (pb & 63); }
+static inline BB bbShl(const BB& a, unsigned s) { return BB{{a.w[0] << s, (a.w[1] << s) | (a.w[0] >> (64 - s)), (a.w[2] << s) | (a.w[1] >> (64 - s)), (a.w[3] << s) | (a.w[2] >> (64 - s))}}; }
+static inline BB bbShr(const BB& a, unsigned s) { return BB{{(a.w[0] >> s) | (a.w[1] << (64 - s)), (a.w[1] >> s) | (a.w[2] << (64 - s)), (a.w[2] >> s) | (a.w[3] << (64 - s)), a.w[3] >> s}}; }
+static bool BBOK = false; static unsigned BW = 0;
+static uint8_t PIDX[256]; static uint16_t CELLOF[256];
+static BB FLOORBB, GOALBB;
+static inline BB bbNeighbors(const BB& a) {
+  BB l = bbShr(a, 1), r = bbShl(a, 1), u = bbShr(a, BW), d = bbShl(a, BW);
+  return BB{{l.w[0] | r.w[0] | u.w[0] | d.w[0], l.w[1] | r.w[1] | u.w[1] | d.w[1], l.w[2] | r.w[2] | u.w[2] | d.w[2], l.w[3] | r.w[3] | u.w[3] | d.w[3]}};
+}
+static void setupBB() {
+  BW = C + 1; BBOK = R * BW < 256;
+  FLOORBB = BB{{0, 0, 0, 0}}; GOALBB = BB{{0, 0, 0, 0}};
+  if (!BBOK) return;
+  for (unsigned i = 0; i < N; i++) {
+    unsigned pb = (i / C) * BW + (i % C); PIDX[i] = (uint8_t)pb; CELLOF[pb] = (uint16_t)i;
+    if (!WALL[i]) bbSet(FLOORBB, pb);
+    if (ISGOAL[i]) bbSet(GOALBB, pb);
+  }
+}
+
 inline bool deadCell(uint32_t c) { return DMIN[c] == NONE; }
 template<class M> inline bool boxAt(M mask, uint32_t cell) { return cell != NONE && liveIdx[cell] != NONE && ((mask >> liveIdx[cell]) & (M)1); }
 
@@ -205,6 +234,41 @@ template<class M> void keeperBFS(Scratch& sc, M mask, uint32_t keeper) {
   }
 }
 inline bool kReach(Scratch& sc, uint32_t cell) { return cell != NONE && sc.kstamp[cell] == sc.kcur; }
+// Bitboard flood fill: same contract as keeperBFSDom (nt = 0 for a plain BFS),
+// but each distance layer is a handful of branch-free 64-bit shifts and masks
+// instead of a queue walk with three unpredictable branches per neighbor
+// (p15: ~19% faster overall). kstamp/kdist are written only for the cells the
+// search reads afterwards, so kReach() / kdist keep working unchanged: push
+// spots (free cells next to a box), goals (for the finishing walk), and the
+// dominance targets.
+template<class M> bool keeperBFSbb(Scratch& sc, M mask, uint32_t keeper, const uint32_t* tk, const uint32_t* budget, unsigned nt) {
+  if (sc.kcur == UINT32_MAX) { fill(sc.kstamp.begin(), sc.kstamp.end(), 0u); sc.kcur = 0; }  // stamp wrap guard
+  const uint32_t cur0 = ++sc.kcur;
+  BB box{{0, 0, 0, 0}};
+  for (M m = mask; m; m &= m - (M)1) bbSet(box, PIDX[liveCell[MCTZ(m)]]);
+  BB fr, interest; const BB adj = bbNeighbors(box);
+  for (unsigned w = 0; w < 4; w++) { fr.w[w] = FLOORBB.w[w] & ~box.w[w]; interest.w[w] = (adj.w[w] | GOALBB.w[w]) & fr.w[w]; }
+  uint32_t maxBudget = 0;
+  for (unsigned i = 0; i < nt; i++) { if (tk[i] == keeper) return true; bbSet(interest, PIDX[tk[i]]); if (budget[i] > maxBudget) maxBudget = budget[i]; }
+  sc.kstamp[keeper] = cur0; sc.kdist[keeper] = 0;
+  BB vis{{0, 0, 0, 0}}; bbSet(vis, PIDX[keeper]); BB f = vis;
+  for (uint32_t d = 1;; d++) {
+    BB n = bbNeighbors(f); uint64_t any = 0;
+    for (unsigned w = 0; w < 4; w++) { n.w[w] &= fr.w[w] & ~vis.w[w]; vis.w[w] |= n.w[w]; any |= n.w[w]; }
+    if (!any) break;
+    f = n;
+    const bool check = d <= maxBudget;
+    for (unsigned w = 0; w < 4; w++) {
+      uint64_t h = n.w[w] & interest.w[w];
+      while (h) {
+        uint32_t c = CELLOF[w * 64 + (unsigned)__builtin_ctzll(h)]; h &= h - 1;
+        sc.kstamp[c] = cur0; sc.kdist[c] = d;
+        if (check) for (unsigned i = 0; i < nt; i++) if (c == tk[i] && d <= budget[i]) return true;
+      }
+    }
+  }
+  return false;
+}
 // keeperBFS that doubles as the dominance test (see DomHash): tk[i] / budget[i]
 // are stored variants' keeper cells and walk budgets (g - ga). Returns true as
 // soon as some tk[i] is reached within budget[i] moves, leaving the BFS
@@ -600,9 +664,10 @@ int run(const string& board, double timeout, bool wantSolution, bool dbg, bool u
           if (useDom) {
             uint32_t tk[DOMK], budget[DOMK]; unsigned stored; size_t emptySlot;
             unsigned nt = dom.lookup(mask, g, tk, budget, stored, emptySlot);
-            if (keeperBFSDom(sc, mask, keeper, tk, budget, nt)) { pr++; continue; }
+            if (BBOK ? keeperBFSbb(sc, mask, keeper, tk, budget, nt) : keeperBFSDom(sc, mask, keeper, tk, budget, nt)) { pr++; continue; }
             dom.record(mask, keeper, g, stored, emptySlot);
-          } else keeperBFS(sc, mask, keeper);
+          } else if (BBOK) keeperBFSbb(sc, mask, keeper, nullptr, nullptr, 0);
+          else keeperBFS(sc, mask, keeper);
         } else keeperBFS(sc, mask, keeper);
         ex++;
         // all boxes placed? -> finish by walking keeper to nearest free goal
@@ -781,7 +846,7 @@ int main(int argc, char** argv) {          // argc/argv/return are int by the la
     if (pos.size() >= 2) timeout = atof(pos[1].c_str());
   }
   if (!BOARDS.count(board)) { printf("unknown board %s\n", board.c_str()); return 1; }
-  setup(BOARDS[board]);
+  setup(BOARDS[board]); setupBB();
 
   // Dispatch on live-cell count: <=32 uses the fast uint32 mask + packed hash.
   // 33..128 uses a 128-bit mask + wide hash. Beyond that is unsupported.

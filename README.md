@@ -35,9 +35,9 @@ Positional arguments are `boardId` then `timeoutSec`. Flags may appear anywhere.
 ```
 $ ./solver p15 600 --solution
 [p15] boxes=8 goals=9 live=32 h0=32 timeout=600s
-  ...expanded 4120572, f=87 gen=17268883 pruned=3658135 best=-1 1s      <- progress every ~4M expansions
+  ...expanded 4120564, f=87 gen=17269394 pruned=3658143 best=-1 0s      <- progress every ~4M expansions
   ...
-RESULT p15 optimal=184 expanded=21399369 pruned=27691560 generated=76488946 seconds=2.9 threads=24
+RESULT p15 optimal=184 expanded=21399195 pruned=27691734 generated=76487677 seconds=2.0 threads=24
 SOLUTION p15 moves=184 RdRdRdRRUrDDDrdLL...
 ```
 
@@ -67,7 +67,7 @@ allowed (they may stay empty). One goal must be left free for the keeper.
 
 Verified optima: p1=6, p2=15, p3=13, p4=17, p5=12, p6=13, p7=47, p8=22, p9=34,
 p10=59, p11=51, p12=41, p13=78, p14=26, p15=184. All solve in well under a
-second except p15 (~3 s / ~1.5 GB on a 12-core desktop).
+second except p15 (~2 s / ~1.5 GB on a 12-core desktop).
 
 ## Algorithm
 
@@ -158,8 +158,11 @@ accelerator: when it is full or a probe runs long, the check is skipped.
 
 | p15, 12-core / 24-thread desktop | expanded | pruned | 1 thread | 12 threads | 24 threads | peak RSS |
 |---|---|---|---|---|---|---|
-| `--no-dominance` | 49,090,929 | 0 | 26.9 s | 5.8 s | 4.2 s | 1.21 GB |
-| default | 21,399,255 | 27,691,674 | 17.6 s | 3.8 s | 2.9 s | 1.47 GB |
+| `--no-dominance` | 49,090,929 | 0 | 20.7 s | 4.2 s | 3.1 s | 1.21 GB |
+| default | 21,399,255 | 27,691,674 | 14.3 s | 2.7 s | 2.0 s | 1.47 GB |
+
+(Times include the bitboard keeper BFS below. Before it: 26.9 / 5.8 / 4.2 s
+without dominance pruning, 17.6 / 3.8 / 2.9 s with it.)
 
 The generated-state count is identical with and without the pruning (76.49 M
 single-threaded), which confirms that every skipped expansion was redundant.
@@ -209,5 +212,19 @@ The search is memory-latency bound, so the implementation leans on:
 Bucket entries packed into single `uint64`s on the fast path. And the chunked
 merge above. The 1 GiB table (2²⁷ slots) used for large fast-path boards was
 measured fastest for the hardest built-in board. p15 pops ~49 M states (21 M
-expanded, 28 M dominance-pruned) in ~2.9 s on a 12-core (24-thread) desktop.
+expanded, 28 M dominance-pruned) in ~2 s on a 12-core (24-thread) desktop.
 Larger tables measurably hurt (TLB spread), smaller ones lengthen probe chains.
+
+After dominance pruning, the per-state keeper BFS was the largest single cost
+(47% of single-thread time on p15). A queue BFS spends most of that on
+mispredicted branches: for every neighbor it asks "wall? box? already
+visited?", and the answers are data-dependent. `keeperBFSbb` replaces it with
+a bitboard flood fill. The board is laid out as a 256-bit grid with each row
+padded by one never-free column, so a cell's neighbors are one-bit and one-row
+shifts, and each distance layer is a few dozen branch-free 64-bit operations
+(`next = neighbors(frontier) & free & ~visited`). Distances are written only for
+the cells the search reads afterwards: push spots next to boxes, goals, and the
+dominance targets. That keeps `kReach()`/`kdist` working unchanged and gives
+exactly the same search (identical single-thread counts). p15: 17.6 s → 14.3 s
+on one thread, 2.9 s → ~2 s on 24. Boards whose padded grid exceeds 255 bits
+fall back to the queue BFS.
